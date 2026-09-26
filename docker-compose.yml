@@ -1,0 +1,22 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Merge adjacent events of one device into a session when their gap
+      # is at most this many seconds.
+      SESSION_GAP_SECONDS: "300"
+      # Clock calibration: reject an in-epoch anchor whose measured rate
+      # mismatch against the previous anchor exceeds this many ppm, and
+      # allow event normalization to extrapolate at most this many seconds
+      # past the bracketing anchor support.
+      CLOCK_DRIFT_PPM: "50000"
+      CLOCK_MAX_EXTRAPOLATION_SECONDS: "3600"
+      DATABASE_PATH: /data/events.db
+    volumes:
+      - events-data:/data
+    restart: unless-stopped
+
+volumes:
+  events-data:
