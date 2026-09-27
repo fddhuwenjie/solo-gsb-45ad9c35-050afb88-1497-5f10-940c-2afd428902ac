@@ -14,6 +14,8 @@
 
 服务还提供**会话演变快照**：`POST /devices/{device_id}/session-snapshots` 在同一写事务内冻结设备当前的事件单调序列高水位（`events.seq`）并按现有 gap 配置把当时的会话与**有序成员完整复制**入库；`snapshot_id` 全局唯一，同设备重复提交幂等返回原快照，跨设备复用返回 `409`。两快照差异接口以共享 `event_id` 构建旧/新会话二部图，按连通分量判定 `unchanged`、`changed`、`merged`、`split`、`created`、`removed`，多对多分量标为 `reorganized`，输出双方会话 ID、增删成员并稳定排序；gap 配置不同的快照拒绝比较。迟到事件与保留清理都不会改写旧快照（见[会话演变快照](#会话演变快照)）。
 
+服务为每个**首次成功写入**的事件维护一棵**透明回执 Merkle 日志**（RFC 6962 风格）：叶在原 `BEGIN IMMEDIATE` 事务内按 `events.seq` 追加，规范化绑定 `seq`、`device_id`、`event_id`、`occurred_at`、`event_type`、`schema_version` 与 `payload`；幂等重放与失败请求绝不新增叶。支持创建**不可变检查点**、按 `event_id` 取**成员证明**、以及两个检查点间的**一致性证明**，所有证明仅凭返回数据即可离线复算；非法树大小返回 `422`。保留清理只删事件正文，回执叶与旧检查点仍可验证；迁移旧库时按现有 seq 一次性回填且结果可复现（见[透明事件回执](#透明事件回执)）。
+
 ## 启动
 
 ```bash
@@ -1103,6 +1105,139 @@ curl -s http://localhost:8000/retention/cleanup-plans/<id>
 
 清理计划（条件、候选快照、摘要、状态与确认时间）持久化在 SQLite 的 `cleanup_plans` 表中。
 
+## 透明事件回执
+
+每次**首次成功写入**的事件（`POST /events` 与流事件 `PUT .../streams/{stream_id}/events` 走同一条摄取链路）都会在原 **`BEGIN IMMEDIATE`** 事务内、紧邻 `events` 行插入后追加一个 **Merkle 叶**。叶位置是密集的、从 1 开始且永不复用的日志序号；叶同时记录它绑定的 `events.seq`。**幂等重放（`200 replay`）与任何失败请求（`422` 契约失败、`409` 冲突/非法状态机事件）都不会新增叶**——叶与事件行在同一事务内提交或回滚，因此日志严格按到达序只增不改。
+
+### 叶的规范化绑定与 RFC 6962 前缀
+
+每个叶的输入是以下字段的**规范化 JSON**（键排序、无空白、UTF-8），字段固定为：
+
+```json
+{"device_id":"dev-1","event_id":"e1","event_type":null,"occurred_at":"2026-09-20T10:00:00+00:00","payload":null,"schema_version":null,"seq":1}
+```
+
+哈希严格遵循 [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962#section-2.1) 的域分隔：
+
+- 叶哈希：`SHA-256(0x00 || leaf_data)`
+- 内部节点：`SHA-256(0x01 || left_hash || right_hash)`
+
+无载荷事件的 `event_type` / `schema_version` / `payload` 为显式 JSON `null`；`occurred_at` 是归一化后的 UTC ISO-8601（等价时区写法产生同一叶）；`payload` 以规范化 JSON 持久化，对象键序不影响叶哈希。
+
+### 当前日志 `GET /receipts/tree`
+
+```bash
+curl -s http://localhost:8000/receipts/tree
+# {"tree_size":3,"root_hash":"…","checkpoint_count":1}
+```
+
+首个事件写入前 `tree_size` 为 `0`、`root_hash` 为 `null`。
+
+### 创建不可变检查点 `PUT /receipts/checkpoints/{tree_size}`
+
+冻结前 `tree_size` 个叶的 RFC 6962 根。检查点**不可变、不删除**：
+
+- `201 Created`：冻结成功，返回 `tree_size`、`root_hash`、`created_at`。
+- `200 OK`：对同一 `tree_size` 重复 PUT 的幂等回放——返回首次完全相同的 `root_hash` 与 `created_at`，不重新计算。
+- `422 Unprocessable Entity`：`tree_size` 不在 `1..当前树大小`（含 0、未来大小、非整数），`detail.reason` 为 `invalid_tree_size` 并回显 `current_tree_size`；不写入任何检查点。
+
+```bash
+curl -s -X PUT http://localhost:8000/receipts/checkpoints/3
+# 201 {"tree_size":3,"root_hash":"6f2a…","created_at":"…"}
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  http://localhost:8000/receipts/checkpoints/3     # => 200（幂等回放）
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  http://localhost:8000/receipts/checkpoints/99    # => 422（树还没这么大）
+```
+
+`GET /receipts/checkpoints` 按 `tree_size` 升序列出检查点；`GET /receipts/checkpoints/{tree_size}` 取单个（未知 `404`）。
+
+### 成员证明 `GET /events/{event_id}/receipt`
+
+按 `event_id` 返回该事件叶在指定树大小（可选 `?tree_size=`，默认当前大小）下的**包含证明（Merkle Audit Path）**。返回数据足以**仅凭自身离线复算**根：
+
+| 字段 | 含义 |
+|---|---|
+| `leaf_index` | 叶的密集 1-based Merkle 位置 |
+| `event_seq` | 绑定的、不复用的 `events.seq` |
+| `tree_size` | 证明所基于的树大小 |
+| `leaf_data` | 被哈希的完整规范化文档（验证方重新规范化即可） |
+| `leaf_hash` | 十六进制 `SHA-256(0x00 || leaf_data)` |
+| `audit_path` | 自底向上的 RFC 6962 审计路径（每项为 32 字节节点哈希的十六进制；单叶树为 `[]`） |
+| `root_hash` | 按 `tree_size` 复算的根，可与可信检查点比对 |
+| `checkpoint` | 当该大小存在检查点时，回显冻结的 `root_hash` / `created_at`；否则为 `null` |
+
+- `404 Not Found`：该 `event_id` 没有回执叶。
+- `422`：`tree_size` 非法（非正、超过当前树，`reason=invalid_tree_size`），或该叶不属于那么小的树（`reason=leaf_not_in_tree`）。
+
+```bash
+curl -s 'http://localhost:8000/events/e1/receipt?tree_size=3'
+```
+
+**离线验证示例**（不访问服务，仅用上面返回的 JSON 与一个可信检查点根）：
+
+```python
+import hashlib, json
+
+def H(prefix, *parts):                 # RFC 6962 域分隔
+    return hashlib.sha256(prefix + b"".join(parts)).digest()
+
+def split(n):                          # 严格小于 n 的最大 2 的幂（n >= 2）
+    return 1 << ((n - 1).bit_length() - 1)
+
+def verify(proof, trusted_root_hex):
+    data = json.dumps(proof["leaf_data"], sort_keys=True,
+                      separators=(",", ":"), ensure_ascii=False).encode()
+    leaf = H(b"\x00", data)            # 必须等于 proof["leaf_hash"]
+    assert leaf.hex() == proof["leaf_hash"]
+    nodes = [bytes.fromhex(x) for x in proof["audit_path"]]
+    idx, size = proof["leaf_index"] - 1, proof["tree_size"]
+    cursor = 0
+    def take():
+        nonlocal cursor
+        node = nodes[cursor]; cursor += 1
+        return node
+    def walk(m, n):                    # RFC 6962 §2.1.1/§2.1.2 复算
+        if n == 1:
+            return leaf
+        k = split(n)
+        if m < k:                      # 兄弟是右侧子树根
+            inner = walk(m, k)
+            return H(b"\x01", inner, take())
+        inner = walk(m - k, n - k)     # 兄弟在左侧
+        return H(b"\x01", take(), inner)
+    root = walk(idx, size)
+    assert cursor == len(nodes)        # 路径必须恰好消费完
+    assert root.hex() == trusted_root_hex
+```
+
+> 注意：非 2 的幂大小的树，审计路径长度是**变化的**（例如 3 叶树的第 3 个叶只有一个兄弟节点，而非两个）；上面按树分裂递归复算，天然处理这种情况，不依赖“树高固定”的逐位算法。
+
+### 一致性证明 `GET /receipts/consistency/{first_size}/{second_size}`
+
+返回两个**已冻结检查点**之间的**一致性证明（Merkle Consistency Proof）**：持有较早检查点可信根的客户端可仅凭返回数据离线复算出**两个根**，从而证明新树只是老树的**严格追加**——历史叶一个都没有被改写。
+
+- `200 OK`：返回两个 `tree_size`、两边的 `root_hash` / `created_at` 与自底向上的 `consistency_path`（大小相等时为 `[]`）。
+- `404 Not Found`：任一 `tree_size` 没有对应检查点。
+- `422`：不满足 `1 <= first_size <= second_size <= 当前树大小`（`reason=invalid_tree_size`）。
+
+```bash
+curl -s http://localhost:8000/receipts/consistency/3/7
+# {"first_tree_size":3,"second_tree_size":7,
+#  "first_root_hash":"6f2a…","second_root_hash":"b910…",
+#  "first_checkpoint_created_at":"…","second_checkpoint_created_at":"…",
+#  "consistency_path":["…", "…"]}
+```
+
+离线复算遵循 RFC 6962 §2.1.4：从路径重建时，在顶层边界用**可信的旧根**作为左子树，路径节点按自底向上顺序消费；复算出的旧根必须等于可信旧根、新根必须等于响应中的 `second_root_hash`。
+
+### 与保留清理的关系、存储与迁移
+
+- **清理只删事件正文**：`event_receipt_leaves` 对 `events` **不建外键**，且叶内存有完整规范化文档副本。[可确认的保留清理](#可确认的保留清理)删除事件后，叶、按 `event_id` 的成员证明、旧检查点以及检查点间一致性证明**原样可验证**（被删事件仍可凭其叶与旧检查点离线证明曾被收录）；之后新事件继续追加日志，跨越清理点的一致性证明照常成立。
+- 叶与检查点分别持久化在 SQLite 的 `event_receipt_leaves`（密集 Merkle 位置 `seq`、绑定的 `event_seq`、`event_id`、规范化 `leaf_data`、`leaf_hash`、`created_at`）与 `receipt_checkpoints`（`tree_size` 主键、`root_hash`、`created_at`）表，二者只追加、不更新、不删除。
+- **旧库一次性回填**：升级后服务启动在单个事务内为回填前已存在的事件按 `events.seq` 顺序补叶；只用存储中已归一化的列，因此**结果逐字节可复现**（同一批事件在任意旧库回填出相同的根）。叶位置按到达序密集编号——即使旧库在升级前已删除过事件、使现存 `events.seq` 有缺口，Merkle 位置仍连续无缺口（缺口只体现在叶绑定的 `event_seq` 上）。回填幂等：已有叶即为空操作；之后新事件继续在密集尾部追加。
+- 并发模型沿用 WAL + `BEGIN IMMEDIATE` + `busy_timeout`：叶追加与事件插入、状态机投影、告警重放在同一把单写者锁下串行提交，任何一步失败整体回滚，绝不留下半个叶。
+
 ## 会话标识
 
 `session_id` 是确定性的 SHA-256：对 `device_id` 与按 `(occurred_at, event_id)` 排序的成员列表（每个成员取 UTC ISO-8601 时间戳与 `event_id`）做哈希。成员集合不变，标识不变；迟到事件桥接两组后成员变化，标识随之更新。该算法不包含载荷字段，新旧事件的归并结果完全一致。
@@ -1122,7 +1257,7 @@ curl -s localhost:8000/devices/d/sessions        # => 1 个会话，成员 [a, c
 
 ## 持久化与并发模型
 
-契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
+契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。透明回执的 Merkle 叶与不可变检查点保存在 `event_receipt_leaves` / `receipt_checkpoints` 表（叶是规范化事件文档的完整副本、不引用 `events` 行，因此清理删除事件正文后回执仍可验证）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
 
 ### 自动迁移与单调序列 `seq`
 
@@ -1132,9 +1267,10 @@ curl -s localhost:8000/devices/d/sessions        # => 1 个会话，成员 [a, c
 
 1. 旧 `events` 表缺少 `seq` 列时，先按需补齐 `event_type` / `schema_version` / `payload` 旧列；
 2. 以新结构重建 `events` 表，历史行按原 `rowid` 顺序赋值 `seq`（保持到达次序），并重建两个索引、保留 `event_id` 的唯一约束；
-3. AUTOINCREMENT 计数器自动初始化为迁移行的最大 `seq`，此后新事件继续递增、绝不复用。
+3. AUTOINCREMENT 计数器自动初始化为迁移行的最大 `seq`，此后新事件继续递增、绝不复用；
+4. 透明回执表幂等建出后，在单个事务内为回填前已存在的事件按 `events.seq` 顺序**一次性补 Merkle 叶**（只用已存储的归一化列，结果可复现；现存 `seq` 若因升级前清理而有缺口，叶位置仍密集连续）。已有叶时该步骤为空操作。
 
-迁移期间无需停写之外的额外操作；重复启动也是安全的（已迁移的库检测到 `seq` 列即跳过）。若旧库文件较大，首次启动会多花一次表重建的时间。
+迁移期间无需停写之外的额外操作；重复启动也是安全的（已迁移的库检测到 `seq` 列即跳过，已回填回执的库检测到叶即跳过回填）。若旧库文件较大，首次启动会多花一次表重建与叶回填的时间。
 
 ### cursor 版本
 
@@ -1151,9 +1287,9 @@ cursor 前缀随游标格式升级：事件检索当前为 `evc2:`（seq 高水�
 `POST /events` 的写入链路分为**薄路由**与**摄取服务**两层：
 
 - **薄路由**（`app/main.py` 的 `submit_event`）：只负责 HTTP 边界——开启 `BEGIN IMMEDIATE` 写事务、调用摄取服务、成功则 `commit`、任一步失败则 `rollback` 整体回滚；随后把领域错误映射为 HTTP 响应（`ContractError` → `422`、`IngestionConflict` → `409`），并把服务返回的框架无关结果（`IngestionOutcome`）映射为响应模型 `EventAccepted`。
-- **摄取服务**（`app/ingestion.py` 的 `EventIngestionService`）：编排一次事件写入的全部步骤——契约三元组校验、契约解析与载荷校验、幂等判定、事件插入、状态机投影（唯一/零/多匹配判定）、告警重算，以及响应会话的选取。服务通过**显式参数**获取协作者：SQLite 连接按次传入（`ingest(conn, ...)`），契约解析器（`contract_resolver`）与会话构建器（`session_builder`）在构造时注入。服务**不持有模块级连接，也不持有应用级缓存**，因此可以脱离 FastAPI 直接实例化、独立测试（见 `tests/test_ingestion.py`）。
+- **摄取服务**（`app/ingestion.py` 的 `EventIngestionService`）：编排一次事件写入的全部步骤——契约三元组校验、契约解析与载荷校验、幂等判定、事件插入、**透明回执 Merkle 叶追加**、状态机投影（唯一/零/多匹配判定）、告警重算，以及响应会话的选取。服务通过**显式参数**获取协作者：SQLite 连接按次传入（`ingest(conn, ...)`），契约解析器（`contract_resolver`）与会话构建器（`session_builder`）在构造时注入。服务**不持有模块级连接，也不持有应用级缓存**，因此可以脱离 FastAPI 直接实例化、独立测试（见 `tests/test_ingestion.py`）。
 
-事务边界不变：幂等判定、事件插入、状态机投影与告警重算仍由**调用方（路由）开启的同一次 `BEGIN IMMEDIATE`** 覆盖——服务自身不开启、不提交、不回滚事务；任一步失败（包括告警重算抛出异常）都使事件行、转移日志行、状态推进与告警变更**整体回滚**，绝不留下半成品。响应语义不变：`replay`、事件回显、会话与 `state_transition` 的取值与分层前完全一致（会话在提交前基于同一事务快照归并，并发下结果也是确定的）。
+事务边界不变：幂等判定、事件插入、回执叶追加、状态机投影与告警重算仍由**调用方（路由）开启的同一次 `BEGIN IMMEDIATE`** 覆盖——服务自身不开启、不提交、不回滚事务；任一步失败（包括告警重算抛出异常）都使事件行、回执叶、转移日志行、状态推进与告警变更**整体回滚**，绝不留下半成品；幂等重放不追加叶。响应语义不变：`replay`、事件回显、会话与 `state_transition` 的取值与分层前完全一致（会话在提交前基于同一事务快照归并，并发下结果也是确定的）。
 
 每个 `create_app` 实例拥有**各自独立**的连接工厂、解析后契约缓存（`app.state.schema_cache`）与归并间隔配置：契约解析器与会话构建器以本实例的闭包注入服务，缓存与配置归该实例所有——两个实例之间互不串用（`tests/test_ingestion.py` 中有对应的回归验证）。写入链路共用的序列化辅助函数也随分层收敛：`canonical_json` 移至 `app/ingestion.py`、`log_entry_to_dict` 移至 `app/statemachines.py`，`app.main` 直接复用。
 

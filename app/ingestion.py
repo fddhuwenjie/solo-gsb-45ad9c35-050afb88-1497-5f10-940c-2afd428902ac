@@ -32,6 +32,7 @@ from typing import Any
 
 from .alerts import reconcile_device_alarms
 from .contracts import ContractError, check_payload
+from .receipts import append_event_leaf
 from .sessions import Event, normalize_ts, to_storage
 from .statemachines import (
     LOG_COLUMNS,
@@ -307,13 +308,33 @@ class EventIngestionService:
                     f"event_id {event_id!r} already exists"
                 ) from None
 
+            event_seq = int(inserted.lastrowid)
+            # Transparent receipt: exactly one Merkle leaf per first-time
+            # write, appended in this same transaction (so a later failure
+            # -- e.g. an alert-reconciliation error -- rolls the leaf back
+            # too). The leaf binds the stored, normalized columns; replays
+            # and failed requests never reach this branch.
+            append_event_leaf(
+                conn,
+                event_seq=event_seq,
+                device_id=device_id,
+                event_id=event_id,
+                occurred_at=stored,
+                event_type=event_type,
+                schema_version=schema_version,
+                payload=(
+                    json.loads(stored_payload) if stored_payload is not None else None
+                ),
+                created_at=now,
+            )
+
             if projection is not None:
                 info, index, transition, from_state = projection
                 log_id = append_transition(
                     conn,
                     machine_row,
                     info,
-                    event_seq=int(inserted.lastrowid),
+                    event_seq=event_seq,
                     event_id=event_id,
                     event_type=event_type,
                     occurred_at=occurred,

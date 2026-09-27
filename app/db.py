@@ -323,6 +323,34 @@ CREATE TABLE IF NOT EXISTS session_snapshot_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_session_snapshot_sessions_id
     ON session_snapshot_sessions (snapshot_id, session_id);
+-- Transparent event receipts: one Merkle leaf per successfully written
+-- event, appended in the same BEGIN IMMEDIATE transaction as the events
+-- insert and ordered by the arrival sequence (events.seq). ``seq`` is the
+-- dense, gap-free 1-based leaf index (the Merkle position); ``event_seq``
+-- records the bound events.seq, which can exceed the leaf index only for
+-- rows backfilled from an old database that already deleted some events
+-- before this module existed. The full canonical leaf document is copied
+-- into ``leaf_data`` and there is deliberately NO foreign key to events:
+-- retention cleanup deletes only event bodies, while leaves, receipts and
+-- old checkpoints stay verifiable. Rows are append-only (nothing ever
+-- deletes or updates them), so the tree is a pure Merkle log.
+CREATE TABLE IF NOT EXISTS event_receipt_leaves (
+    seq         INTEGER PRIMARY KEY,  -- dense Merkle leaf index, 1-based
+    event_seq   INTEGER NOT NULL UNIQUE,  -- the bound, never-reused events.seq
+    event_id    TEXT NOT NULL UNIQUE,
+    leaf_data   TEXT NOT NULL,  -- canonical JSON copy of the bound document
+    leaf_hash   TEXT NOT NULL,  -- hex SHA-256(0x00 || leaf_data)
+    created_at  TEXT NOT NULL   -- UTC ISO-8601
+);
+-- Immutable Merkle tree checkpoints: one row per frozen tree size. The
+-- root is RFC 6962 tree hash over the first ``tree_size`` leaves. Once
+-- written a row is never modified or deleted; a repeated create request
+-- replays the stored row (primary key makes it idempotent).
+CREATE TABLE IF NOT EXISTS receipt_checkpoints (
+    tree_size   INTEGER PRIMARY KEY CHECK (tree_size >= 1),
+    root_hash   TEXT NOT NULL,  -- hex RFC 6962 Merkle tree hash
+    created_at  TEXT NOT NULL   -- UTC ISO-8601
+);
 """
 
 # Columns added after the initial release; applied idempotently to existing DBs.
@@ -487,6 +515,7 @@ def init_db(db_path: str) -> None:
                 if column not in existing:
                     conn.execute(f"ALTER TABLE events ADD COLUMN {column} {decl}")
         _migrate_alarm_rule_eras(conn)
+        _backfill_receipt_leaves(conn)
 
 
 def _migrate_alarm_rule_eras(conn: sqlite3.Connection) -> None:
@@ -517,3 +546,28 @@ def _migrate_alarm_rule_eras(conn: sqlite3.Connection) -> None:
         for column, decl in missing
     )
     conn.executescript(alters + _ALARM_ERA_BACKFILL)
+
+
+def _backfill_receipt_leaves(conn: sqlite3.Connection) -> None:
+    """Populate Merkle receipt leaves once for an upgraded database.
+
+    Fresh databases already have the tables (``CREATE TABLE IF NOT
+    EXISTS``) but no leaves, and the first online event write appends the
+    first leaf. An upgraded database may already contain events written
+    before the receipt module existed: they receive their deterministic
+    leaves here, densely ordered by the surviving ``events.seq``, in a
+    single idempotent transaction. Re-running on a populated log is a
+    no-op, and the backfill uses only stored normalized columns, so the
+    result is byte-for-byte reproducible.
+    """
+    # Imported lazily to avoid a module-level import cycle (receipts reuses
+    # the storage timestamp helper from sessions).
+    from .receipts import backfill_leaves
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        backfill_leaves(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
