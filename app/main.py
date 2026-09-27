@@ -72,6 +72,15 @@ from .ingestion import (
     SessionView,
     canonical_json,
 )
+from .receipts import (
+    ReceiptError,
+    consistency_proof as build_consistency_proof,
+    get_checkpoint as get_receipt_checkpoint,
+    list_checkpoints as list_receipt_checkpoints,
+    membership_proof as build_membership_proof,
+    save_checkpoint as save_receipt_checkpoint,
+)
+from .receipts import append_leaf as append_receipt_leaf
 from .retention import (
     normalize_windows,
     plan_digest,
@@ -367,6 +376,77 @@ class CheckpointOut(BaseModel):
     )
     event_count: int
     created_at: datetime
+
+
+# ---------------------------------------------------- transparency receipts
+
+
+class ReceiptCheckpointIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    tree_size: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Tree size to checkpoint; defaults to the current size. Must "
+            "not exceed the current number of receipt leaves"
+        ),
+    )
+
+
+class ReceiptCheckpointOut(BaseModel):
+    tree_size: int = Field(description="Number of leaves the checkpoint covers")
+    root_hash: str = Field(
+        description=(
+            "RFC 6962 Merkle root over the first tree_size receipt "
+            "leaves, SHA-256 hex"
+        )
+    )
+    created_at: datetime
+
+
+class ReceiptLeafOut(BaseModel):
+    seq: int = Field(description="Persistent arrival sequence (events.seq)")
+    device_id: str
+    event_id: str
+    occurred_at: datetime
+    event_type: str | None = None
+    schema_version: str | None = None
+    payload: Any = Field(
+        default=None,
+        description="Parsed JSON payload; null for payload-less events",
+    )
+
+
+class MembershipProofOut(BaseModel):
+    event_id: str
+    leaf_index: int = Field(description="0-based Merkle position of the leaf")
+    tree_size: int = Field(description="Tree size this proof verifies against")
+    root_hash: str = Field(
+        description="Expected Merkle root at tree_size; matches any checkpoint of that size"
+    )
+    leaf: ReceiptLeafOut = Field(
+        description=(
+            "Every field needed to recompute the leaf hash offline: "
+            "prefix 'device-event-receipt-leaf:1\\n' + canonical JSON, "
+            "then SHA-256(0x00 || material)"
+        )
+    )
+    audit_path: list[str] = Field(
+        description="RFC 6962 sibling hashes, SHA-256 hex, in fold order"
+    )
+
+
+class ConsistencyProofOut(BaseModel):
+    first_size: int
+    first_root: str = Field(description="Merkle root of the tree at first_size")
+    second_size: int
+    second_root: str = Field(description="Merkle root of the tree at second_size")
+    proof: list[str] = Field(
+        description=(
+            "RFC 6962 consistency proof hashes (SHA-256 hex); which "
+            "subtree each hash covers is derived from the two sizes alone"
+        )
+    )
 
 
 class SchemaIn(BaseModel):
@@ -1028,7 +1108,7 @@ def create_app(
         db_module.init_db(db_path)
         yield
 
-    app = FastAPI(title="Device Event Session Merger", version="1.11.0", lifespan=lifespan)
+    app = FastAPI(title="Device Event Session Merger", version="1.12.0", lifespan=lifespan)
     app.state.db_path = db_path
     app.state.gap_seconds = gap
     app.state.drift_ppm = drift_limit
@@ -1197,13 +1277,15 @@ def create_app(
 
     # The ingestion service orchestrates the POST /events write path. Its
     # collaborators are this instance's own closures: the contract resolver
-    # is backed by *this* app's schema cache and the session builder by
-    # *this* app's gap configuration, so two create_app instances never
+    # is backed by *this* app's schema cache, the session builder by
+    # *this* app's gap configuration, and the receipt leaf appender extends
+    # *this* app's transparency tree, so two create_app instances never
     # share caches or settings. The SQLite connection is passed per call
     # by the route, which also owns the write transaction.
     ingestion_service = EventIngestionService(
         contract_resolver=get_contract,
         session_builder=session_views_for_device,
+        leaf_appender=append_receipt_leaf,
     )
 
     # ------------------------------------------------------------ endpoints
@@ -1969,6 +2051,194 @@ def create_app(
                 ),
             )
         return checkpoint_out_from_row(row)
+
+    # ------------------------------------------------ transparency receipts
+
+    def receipt_checkpoint_out_from_row(row: sqlite3.Row) -> ReceiptCheckpointOut:
+        return ReceiptCheckpointOut(
+            tree_size=row["tree_size"],
+            root_hash=row["root_hash"],
+            created_at=from_storage(row["created_at"]),
+        )
+
+    @app.post(
+        "/receipts/checkpoints",
+        response_model=ReceiptCheckpointOut,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {"description": "a checkpoint already exists at this tree size (idempotent replay)"},
+            422: {"description": "invalid tree size (below 1 or beyond the current tree)"},
+        },
+    )
+    def create_receipt_checkpoint(
+        response: Response,
+        body: ReceiptCheckpointIn | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> ReceiptCheckpointOut:
+        """Freeze an immutable ``(tree_size, root_hash)`` checkpoint.
+
+        The checkpoint covers the first ``tree_size`` receipt leaves (the
+        current tree size when omitted). The Merkle root is recomputed
+        from the retained leaves and stored once: the tree is append-only,
+        so a repeated POST for the same size replays ``200`` with the
+        originally stored root and ``created_at``. Sizes below 1 or beyond
+        the current tree size return ``422`` and store nothing.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row, created = save_receipt_checkpoint(
+                conn, tree_size=body.tree_size if body is not None else None
+            )
+            conn.commit()
+        except ReceiptError as exc:
+            conn.rollback()
+            raise HTTPException(
+                status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"message": exc.message},
+            ) from exc
+        except Exception:
+            conn.rollback()
+            raise
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return receipt_checkpoint_out_from_row(row)
+
+    @app.get(
+        "/receipts/checkpoints",
+        response_model=list[ReceiptCheckpointOut],
+    )
+    def list_receipt_checkpoints_endpoint(
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> list[ReceiptCheckpointOut]:
+        """List every stored receipt checkpoint, ordered by tree size."""
+        return [
+            receipt_checkpoint_out_from_row(row)
+            for row in list_receipt_checkpoints(conn)
+        ]
+
+    @app.get(
+        "/receipts/checkpoints/{tree_size}",
+        response_model=ReceiptCheckpointOut,
+        responses={404: {"description": "no checkpoint stored at this tree size"}},
+    )
+    def get_receipt_checkpoint_endpoint(
+        tree_size: Annotated[int, Path(ge=1)],
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> ReceiptCheckpointOut:
+        row = get_receipt_checkpoint(conn, tree_size)
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"no receipt checkpoint stored at tree size {tree_size}",
+            )
+        return receipt_checkpoint_out_from_row(row)
+
+    @app.get(
+        "/receipts/proof/{event_id}",
+        response_model=MembershipProofOut,
+        responses={
+            404: {"description": "the event has no receipt leaf"},
+            422: {"description": "invalid tree size for the proof"},
+        },
+    )
+    def get_membership_proof(
+        event_id: str,
+        tree_size: int | None = Query(
+            default=None,
+            ge=1,
+            description=(
+                "Tree size to prove against; defaults to the current size. "
+                "Must exceed the leaf's index and not exceed the current size"
+            ),
+        ),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> MembershipProofOut:
+        """Inclusion proof for one event's receipt leaf, by ``event_id``.
+
+        The response carries the full leaf (every field needed to recompute
+        the RFC 6962 leaf hash offline), its 0-based ``leaf_index``, the
+        ``tree_size`` and expected ``root_hash`` it verifies against, and
+        the ``audit_path`` of sibling hashes. Verification needs nothing
+        but this response. The leaf is read from the receipt tree, so the
+        proof stays available and verifiable even after retention cleanup
+        has deleted the event body.
+        """
+        try:
+            proof = build_membership_proof(conn, event_id, tree_size=tree_size)
+        except ReceiptError as exc:
+            raise HTTPException(
+                status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"message": exc.message},
+            ) from exc
+        if proof is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"event {event_id!r} has no transparency receipt leaf",
+            )
+        leaf = proof.leaf
+        return MembershipProofOut(
+            event_id=event_id,
+            leaf_index=leaf["leaf_index"],
+            tree_size=proof.tree_size,
+            root_hash=proof.root_hash,
+            leaf=ReceiptLeafOut(
+                seq=leaf["event_seq"],
+                device_id=leaf["device_id"],
+                event_id=leaf["event_id"],
+                occurred_at=from_storage(leaf["occurred_at"]),
+                event_type=leaf["event_type"],
+                schema_version=leaf["schema_version"],
+                payload=(
+                    json.loads(leaf["payload"])
+                    if leaf["payload"] is not None
+                    else None
+                ),
+            ),
+            audit_path=list(proof.audit_path),
+        )
+
+    @app.get(
+        "/receipts/consistency",
+        response_model=ConsistencyProofOut,
+        responses={
+            422: {
+                "description": (
+                    "invalid tree sizes (first > second, or beyond the "
+                    "current tree)"
+                )
+            }
+        },
+    )
+    def get_consistency_proof(
+        first: int = Query(ge=1, description="Earlier tree size"),
+        second: int = Query(ge=1, description="Later tree size"),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> ConsistencyProofOut:
+        """RFC 6962 consistency proof between two tree sizes.
+
+        Proves the tree grew append-only: every leaf covered by the
+        ``first`` size is unchanged inside the ``second`` size. Both roots
+        are recomputed from the retained leaves and therefore match the
+        checkpoints stored for those sizes. Requires
+        ``1 <= first <= second <= current size``; anything else returns
+        ``422``. Verification needs only the returned data.
+        """
+        try:
+            proof = build_consistency_proof(
+                conn, first_size=first, second_size=second
+            )
+        except ReceiptError as exc:
+            raise HTTPException(
+                status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"message": exc.message},
+            ) from exc
+        return ConsistencyProofOut(
+            first_size=proof.first_size,
+            first_root=proof.first_root,
+            second_size=proof.second_size,
+            second_root=proof.second_root,
+            proof=list(proof.proof),
+        )
 
     # ------------------------------------------------------- command queue
 

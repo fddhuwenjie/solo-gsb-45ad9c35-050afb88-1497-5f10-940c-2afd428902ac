@@ -103,6 +103,11 @@ ContractResolver = Callable[[sqlite3.Connection, str, str], dict[str, Any] | Non
 # Build every session of one device from its stored events, in session
 # order. Injected bound to the app instance's configured gap seconds.
 SessionBuilder = Callable[[sqlite3.Connection, str], list[SessionView]]
+# Append the transparency-receipt Merkle leaf for one freshly inserted
+# event, inside the same write transaction. Injected by the app factory
+# (bound to app.receipts.append_leaf); keyword arguments mirror
+# append_leaf's signature minus the connection.
+LeafAppender = Callable[..., None]
 
 
 class EventIngestionService:
@@ -120,9 +125,11 @@ class EventIngestionService:
         *,
         contract_resolver: ContractResolver,
         session_builder: SessionBuilder,
+        leaf_appender: LeafAppender | None = None,
     ) -> None:
         self._contract_resolver = contract_resolver
         self._session_builder = session_builder
+        self._leaf_appender = leaf_appender
 
     def ingest(
         self,
@@ -306,6 +313,24 @@ class EventIngestionService:
                 raise IngestionConflict(
                     f"event_id {event_id!r} already exists"
                 ) from None
+
+            if self._leaf_appender is not None:
+                # Transparency receipt: exactly one Merkle leaf per
+                # first-time accepted event, appended in the same
+                # transaction, ordered by the persistent events.seq.
+                # Replays (the branch above) and rejected events (the
+                # transaction rolls back) never append a leaf.
+                self._leaf_appender(
+                    conn,
+                    event_seq=int(inserted.lastrowid),
+                    device_id=device_id,
+                    event_id=event_id,
+                    occurred_at=stored,
+                    event_type=event_type,
+                    schema_version=schema_version,
+                    payload=stored_payload,
+                    now=now,
+                )
 
             if projection is not None:
                 info, index, transition, from_state = projection

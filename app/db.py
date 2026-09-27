@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from . import receipts
+
 # The ``events`` table carries ``seq``: an INTEGER PRIMARY KEY
 # AUTOINCREMENT. Unlike the implicit rowid, its value is never reused after
 # the current maximum row is deleted (the high-water mark survives in
@@ -323,6 +325,37 @@ CREATE TABLE IF NOT EXISTS session_snapshot_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_session_snapshot_sessions_id
     ON session_snapshot_sessions (snapshot_id, session_id);
+-- Event transparency receipts: an append-only RFC 6962 Merkle tree over
+-- every event ever accepted, in arrival order. ``leaf_index`` is the
+-- 0-based Merkle position (contiguous, assigned under the single writer
+-- lock); ``event_seq`` mirrors the event's persistent ``events.seq`` at
+-- insert time, so leaf order is exactly arrival order. The leaf copies
+-- every field its hash commits to (seq, device_id, event_id, occurred_at,
+-- event_type, schema_version, payload) and deliberately has no REFERENCES
+-- events(event_id): retention cleanup deletes only event bodies, while
+-- the receipt leaves -- and therefore every membership proof and
+-- checkpoint -- remain verifiable afterwards.
+CREATE TABLE IF NOT EXISTS receipt_leaves (
+    leaf_index  INTEGER PRIMARY KEY CHECK (leaf_index >= 0),
+    event_seq   INTEGER NOT NULL UNIQUE,  -- events.seq at insert time
+    event_id    TEXT NOT NULL UNIQUE,
+    device_id   TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,  -- UTC ISO-8601, same storage form as events
+    event_type  TEXT,
+    schema_version TEXT,
+    payload     TEXT,           -- canonicalized JSON, NULL for payload-less events
+    leaf_hash   TEXT NOT NULL,  -- RFC 6962 leaf hash, SHA-256 hex
+    created_at  TEXT NOT NULL
+);
+-- Immutable transparency checkpoints: one (tree_size, root_hash) pair per
+-- tree size, computed once and replayed verbatim on repeat creation. The
+-- tree is append-only, so a size's root never changes; old checkpoints
+-- stay verifiable against the retained leaves forever.
+CREATE TABLE IF NOT EXISTS receipt_checkpoints (
+    tree_size  INTEGER PRIMARY KEY CHECK (tree_size >= 1),
+    root_hash  TEXT NOT NULL,  -- Merkle root over leaves 0..tree_size-1, hex
+    created_at TEXT NOT NULL
+);
 """
 
 # Columns added after the initial release; applied idempotently to existing DBs.
@@ -487,6 +520,13 @@ def init_db(db_path: str) -> None:
                 if column not in existing:
                     conn.execute(f"ALTER TABLE events ADD COLUMN {column} {decl}")
         _migrate_alarm_rule_eras(conn)
+        # One-shot, idempotent backfill of the transparency receipt tree:
+        # events stored before this module existed receive their Merkle
+        # leaves in events.seq order. The result depends only on the
+        # stored events, so migrating identical legacy databases yields
+        # identical trees; on databases that are already current this is
+        # a no-op.
+        receipts.backfill_leaves(conn)
 
 
 def _migrate_alarm_rule_eras(conn: sqlite3.Connection) -> None:

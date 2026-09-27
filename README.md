@@ -10,6 +10,8 @@
 
 设备还可以注册**采集流（collection stream）**做采集完整性管理：`PUT /devices/{device_id}/streams/{stream_id}` 注册采集流，流内事件以设备自分配的 `source_seq`（**从 1 开始**，允许乱序补传）经 `.../streams/{stream_id}/events` 提交，并在现有摄取事务内一并落库；`(device_id, stream_id, source_seq)` 只能绑定一个 `event_id`，同内容重放幂等，序号或 `event_id` 冲突返回 `409`。状态接口返回 `highest_seen`、`contiguous_through` 与压缩后的 `missing_ranges`；检查点仅在 `1..through_seq` 无缺口时保存按 `source_seq`、`event_id` 计算的 SHA-256，否则 `409`，重复创建返回原结果。清理事件后，序号账本与检查点仍保留（见[采集完整性](#采集完整性)）。
 
+服务还提供**事件透明回执**：每个首次成功写入的事件在原 `BEGIN IMMEDIATE` 事务内按 `events.seq` 向一棵仅追加的 [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) Merkle 树追加一个规范化叶（绑定 `seq`、`device_id`、`event_id`、`occurred_at`、`event_type`、`schema_version` 与 `payload`）；幂等重放与失败请求不新增叶。可创建不可变检查点、按 `event_id` 取成员证明、取两个检查点间的一致性证明，证明仅凭返回数据即可离线复算；保留清理只删事件正文，回执、叶与旧检查点仍可验证（见[事件透明回执](#事件透明回执)）。
+
 服务还内置**设备时钟校准**：设备上报 `(anchor_id, observed_seq, device_time, reference_time)` 锚点，`anchor_id` 内容一致时幂等、`observed_seq` 必须递增，`device_time` 不前进（回退或相等）即开启新 epoch；同一 epoch 内用相邻锚点线性插值把设备时间归一化到参考时间，漂移超过 `CLOCK_DRIFT_PPM` 或 `reference_time` 不递增的锚点返回 `409` 且不落库，锚点支持区间外仅在配置的外推范围内线性外推。单事件归一化接口返回 `corrected_at`、epoch、计算方式与不确定区间；跨设备时间线按 `corrected_at` 排序，并在首个游标中冻结各设备锚点高水位，使翻页过程中新写入的锚点不会造成重复或漏项（见[设备时钟校准](#设备时钟校准)）。
 
 服务还提供**会话演变快照**：`POST /devices/{device_id}/session-snapshots` 在同一写事务内冻结设备当前的事件单调序列高水位（`events.seq`）并按现有 gap 配置把当时的会话与**有序成员完整复制**入库；`snapshot_id` 全局唯一，同设备重复提交幂等返回原快照，跨设备复用返回 `409`。两快照差异接口以共享 `event_id` 构建旧/新会话二部图，按连通分量判定 `unchanged`、`changed`、`merged`、`split`、`created`、`removed`，多对多分量标为 `reorganized`，输出双方会话 ID、增删成员并稳定排序；gap 配置不同的快照拒绝比较。迟到事件与保留清理都不会改写旧快照（见[会话演变快照](#会话演变快照)）。
@@ -815,6 +817,156 @@ curl -s -X PUT $BASE/devices/dev-1/streams/main/checkpoints/5
 
 升级到本版本时服务启动以 `CREATE TABLE IF NOT EXISTS` **自动、幂等**建表（旧库无需手工脚本，Docker Compose 启动方式、端口与既有接口——包括原 `POST /events`——完全不变）。并发模型沿用 WAL + `BEGIN IMMEDIATE` + `busy_timeout`：账本判定与事件落库、状态机投影、告警重算在同一把单写者锁下串行化提交。
 
+## 事件透明回执
+
+每个**首次成功写入**的事件都会在原 `BEGIN IMMEDIATE` 事务内按 `events.seq`（持久、单调、不复用的到达序）向一棵仅追加的 [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) Merkle 树追加一个叶：`leaf_index` 从 0 开始连续编号，叶的顺序即事件到达顺序（与 `occurred_at` 无关）。**幂等重放**（`200`）不新增叶；**失败请求**（`409` / `422`）整个事务回滚，同样不留叶。经采集流提交的事件与 `POST /events` 共用同一摄取链路，因此同样追加叶。
+
+### 规范化叶与哈希规则
+
+叶材料为域分隔前缀 `device-event-receipt-leaf:1\n` 后接**规范化 JSON**（键排序、无空白分隔符、UTF-8），绑定事件的全部回执字段：
+
+```json
+{"seq":1,"device_id":"dev-1","event_id":"e1","occurred_at":"2026-09-20T10:00:00+00:00","event_type":"telemetry","schema_version":"1.0","payload":{"reading":21.5}}
+```
+
+- `occurred_at` 为 UTC 规范化后的存储形式（`+00:00` 偏移）；同一时刻的不同时区写法归一化为同一片叶。
+- `payload` 为规范化 JSON 值；无载荷事件为 `null`（`event_type` / `schema_version` 同为 `null`）。
+
+哈希采用 RFC 6962 第 2.1 节规则：叶 `SHA-256(0x00 || 材料)`，内部节点 `SHA-256(0x01 || 左 || 右)`；`n` 个叶的树在**小于 `n` 的最大 2 的幂**处递归拆分。树按 `events.seq` 生长：迟到事件（事件时间更早）依然按到达顺序追加到树尾。
+
+### 创建不可变检查点 `POST /receipts/checkpoints`
+
+请求体可省略，或带 `{"tree_size": N}`（缺省为当前树大小）。检查点是冻结的 `(tree_size, root_hash)` 对：
+
+- `201 Created`：创建成功，返回 `tree_size`、`root_hash` 与 `created_at`。
+- `200 OK`：该大小已存在检查点——幂等回放首次存储的同一份结果（树仅追加，同一大小的根必然一致，不重新计算）。
+- `422 Unprocessable Entity`：`tree_size < 1` 或超过当前叶数（空树同样 `422`），不存储任何内容。
+
+`GET /receipts/checkpoints` 按 `tree_size` 升序列出全部检查点；`GET /receipts/checkpoints/{tree_size}` 取单个（未知返回 `404`）。
+
+```bash
+BASE=http://localhost:8000
+
+# 两个首次写入的事件 -> 两片叶（leaf_index 0、1）
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev-1","event_id":"e1","occurred_at":"2026-09-20T10:00:00Z"}'
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev-1","event_id":"e2","occurred_at":"2026-09-20T10:01:00Z"}'
+
+# 冻结当前树（大小 2）-> 201；重复创建 -> 200 同一份结果
+curl -s -X POST $BASE/receipts/checkpoints
+# {"tree_size":2,"root_hash":"…","created_at":"…"}
+```
+
+### 按 event_id 取得成员证明 `GET /receipts/proof/{event_id}`
+
+返回完整叶（重算叶哈希所需的全部字段）、`leaf_index`、证明针对的 `tree_size` 与期望 `root_hash`，以及 RFC 6962 审计路径 `audit_path`（十六进制兄弟哈希，按折叠顺序排列）。可选 `?tree_size=N` 针对历史树大小取证：`N` 必须大于该叶的 `leaf_index` 且不超过当前树大小，否则 `422`；事件没有回执叶时返回 `404`。
+
+**仅凭响应数据即可离线验证**（以下参考实现与 `app.receipts.compute_leaf_hash` / `app.receipts.verify_membership` 完全一致）：
+
+```python
+import hashlib, json
+from datetime import datetime, timezone
+
+def norm_ts(raw):  # 归一化为存储形式（UTC ISO-8601，+00:00 偏移）
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+def leaf_hash(leaf):
+    material = json.dumps({
+        "seq": leaf["seq"], "device_id": leaf["device_id"],
+        "event_id": leaf["event_id"],
+        "occurred_at": norm_ts(leaf["occurred_at"]),
+        "event_type": leaf["event_type"],
+        "schema_version": leaf["schema_version"],
+        "payload": leaf["payload"],
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(
+        b"\x00" + b"device-event-receipt-leaf:1\n" + material.encode()
+    ).digest()
+
+def verify_membership(proof):
+    fn, sn = proof["leaf_index"], proof["tree_size"] - 1
+    r = leaf_hash(proof["leaf"])
+    for sibling in proof["audit_path"]:
+        sibling = bytes.fromhex(sibling)
+        if fn & 1 or fn == sn:   # 兄弟在左
+            r = hashlib.sha256(b"\x01" + sibling + r).digest()
+        else:                    # 兄弟在右
+            r = hashlib.sha256(b"\x01" + r + sibling).digest()
+        fn >>= 1; sn >>= 1
+    return r.hex() == proof["root_hash"]
+
+proof = requests.get(f"{BASE}/receipts/proof/e1").json()
+assert verify_membership(proof)
+```
+
+### 两个检查点间的一致性证明 `GET /receipts/consistency?first=N&second=M`
+
+返回 `first_size` / `first_root`、`second_size` / `second_root` 与 RFC 6962 一致性证明 `proof`（十六进制哈希列表），证明树从 `first` 到 `second` **仅追加生长**（旧叶一片未改）。要求 `1 <= first <= second <= 当前树大小`，否则 `422`；`first == second` 时证明为空且两根相同。两个根与对应大小的已存检查点一致，因此可以拿着旧检查点验证"树没有回改历史"。
+
+验证同样仅凭返回数据：证明中每个哈希覆盖的子树区间 `(start, size)` 由两个树大小唯一确定（布局算法与生成算法互为镜像），据此按 MTH 定义把两个根分别重组出来比对即可：
+
+```python
+def verify_consistency(first, first_root, second, second_root, proof):
+    if first == second:
+        return proof == [] and first_root == second_root
+
+    def split(n):                # 小于 n 的最大 2 的幂
+        k = 1
+        while k < n:
+            k <<= 1
+        return k >> 1
+
+    layout = []                  # 证明中每个哈希覆盖的 (start, size)
+    def walk(m, n, complete, base):
+        if m == n:
+            if not complete:
+                layout.append((base, m))
+            return
+        k = split(n)
+        if m <= k:
+            walk(m, k, complete, base)
+            layout.append((base + k, n - k))
+        else:
+            walk(m - k, n - k, False, base + k)
+            layout.append((base, k))
+    walk(first, second, True, 0)
+    if len(layout) != len(proof):
+        return False
+    subtrees = dict(zip(layout, (bytes.fromhex(h) for h in proof)))
+    if first & (first - 1) == 0:  # 首棵树为满树：证明不含其根，直接补入
+        subtrees[(0, first)] = bytes.fromhex(first_root)
+
+    def mth(start, size):        # 按 MTH 定义从已知子树重组根
+        if (start, size) in subtrees:
+            return subtrees[(start, size)]
+        if size == 1:
+            return None
+        k = split(size)
+        left, right = mth(start, k), mth(start + k, size - k)
+        if left is None or right is None:
+            return None
+        return hashlib.sha256(b"\x01" + left + right).digest()
+
+    return (mth(0, first) == bytes.fromhex(first_root)
+            and mth(0, second) == bytes.fromhex(second_root))
+
+cons = requests.get(f"{BASE}/receipts/consistency",
+                    params={"first": 2, "second": 3}).json()
+assert verify_consistency(cons["first_size"], cons["first_root"],
+                          cons["second_size"], cons["second_root"],
+                          cons["proof"])
+```
+
+### 与保留清理的关系、存储与迁移
+
+- **清理只删事件正文**：回执叶与检查点保存在独立的 `receipt_leaves` / `receipt_checkpoints` 表，对 `events` **不建外键**。[可确认的保留清理](#可确认的保留清理)删除事件后，成员证明照常返回、旧检查点照常可验证、新旧检查点间的一致性证明照常可复算。回执树记录每个 `event_id` 的**首次受理**：事件正文被清理后同一 `event_id` 再次被接受（分配新 `seq`）时不会新增第二片叶，原叶（绑定原 `seq`）继续作为该事件的回执。
+- **迁移旧库**：升级到本版本时，服务启动以 `CREATE TABLE IF NOT EXISTS` 自动、幂等建表，并按现有 `events.seq` 顺序为存量事件**一次性回填**叶（幂等，重复启动不再追加）；回填结果只取决于库存事件，内容相同的旧库迁移后得到完全相同的树与根（可复现）。
+- 并发模型沿用 WAL + `BEGIN IMMEDIATE` + `busy_timeout`：叶追加与事件插入在同一单写者事务内提交，`leaf_index` 因此连续无洞、`event_seq` 严格递增；Docker Compose 启动方式、8000 端口与既有接口完全不变。
+
 ## 设备时钟校准
 
 设备时钟会漂移、跳变甚至被重置。设备在能同时读到本机时钟与可信参考时钟（如对时成功的瞬间）时上报**校准锚点**，服务用锚点把事件携带的设备时间归一化到统一的参考时间轴。
@@ -1122,7 +1274,7 @@ curl -s localhost:8000/devices/d/sessions        # => 1 个会话，成员 [a, c
 
 ## 持久化与并发模型
 
-契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
+契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。事件透明回执的 Merkle 叶与不可变检查点保存在 `receipt_leaves` / `receipt_checkpoints` 表（叶的完整规范化字段与 RFC 6962 叶哈希，不引用 `events` 行，清理后仍可验证）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
 
 ### 自动迁移与单调序列 `seq`
 
